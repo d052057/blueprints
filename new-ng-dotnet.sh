@@ -9,7 +9,7 @@ usage() {
 }
 
 # ---------------------------------------------------------------- config
-APP_NAME=""; FORCE=0; API_PORT=5100; CLIENT_PORT=4200; DOTNET_TFM="net10.0"; BROWSER="msedge"
+APP_NAME=""; FORCE=0; API_PORT=5100; CLIENT_PORT=4200; DOTNET_TFM="net10.0"; BROWSER="chrome"
 while [ $# -gt 0 ]; do
   case "$1" in
     --force)       FORCE=1 ;;
