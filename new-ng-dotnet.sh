@@ -51,12 +51,14 @@ echo "🚀 Generating $APP_NAME  (API http://localhost:$API_PORT, client http://
 
 # ================================================================ 1. BACKEND
 dotnet new webapi -o "$SERVER_DIR" --framework "$DOTNET_TFM" --no-https
+( cd "$SERVER_DIR" && dotnet add package Scalar.AspNetCore )
 mkdir -p "$SERVER_DIR/Controllers" "$SERVER_DIR/Properties"
 
 cat << 'JSON_EOF' > "$SERVER_DIR/appsettings.json"
 {
   "Logging": { "LogLevel": { "Default": "Information", "Microsoft.AspNetCore": "Warning" } },
-  "AllowedHosts": "*"
+  "AllowedHosts": "*",
+  "Docs": { "Enabled": false }
 }
 JSON_EOF
 
@@ -127,6 +129,7 @@ CTRL_EOF
 cat << 'CS_EOF' > "$SERVER_DIR/Program.cs"
 using System.Runtime.InteropServices;
 using System.Text.Json.Serialization;
+using Scalar.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -151,14 +154,18 @@ builder.Services.AddOpenApi();
 
 var app = builder.Build();
 
-if (app.Environment.IsDevelopment())
-{
-    app.MapOpenApi();            // /openapi/v1.json
-}
-else
+if (!app.Environment.IsDevelopment())
 {
     app.UseExceptionHandler();
     app.UseHttpsRedirection();
+}
+
+// API docs: always in Development; elsewhere only when "Docs:Enabled" is true.
+if (app.Environment.IsDevelopment() || app.Configuration.GetValue<bool>("Docs:Enabled"))
+{
+    app.MapOpenApi();                 // /openapi/v1.json
+    app.MapScalarApiReference();      // /scalar
+    app.MapGet("/", () => Results.Redirect("/scalar")).ExcludeFromDescription();
 }
 
 app.UseAuthorization();
@@ -347,6 +354,18 @@ cat << 'JSON_EOF' > "$ROOT_DIR/.vscode/tasks.json"
       "problemMatcher": "$msCompile"
     },
     {
+      "label": "wait-for-api",
+      "type": "shell",
+      "command": "for i in $(seq 1 120); do curl -fs -m 2 http://127.0.0.1:__API_PORT__/health >/dev/null && exit 0; sleep 1; done; echo 'API did not start in time'; exit 1",
+      "problemMatcher": []
+    },
+    {
+      "label": "ng-serve-after-api",
+      "dependsOn": ["wait-for-api", "ng-serve"],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    },
+    {
       "label": "ng-serve",
       "type": "shell",
       "command": "npm start",
@@ -382,13 +401,18 @@ cat << 'JSON_EOF' > "$ROOT_DIR/.vscode/launch.json"
         "ASPNETCORE_ENVIRONMENT": "Development",
         "ASPNETCORE_URLS": "http://localhost:__API_PORT__"
       },
+      "serverReadyAction": {
+        "action": "openExternally",
+        "pattern": "\\bNow listening on:\\s+(https?://\\S+)",
+        "uriFormat": "%s/scalar"
+      },
       "console": "internalConsole"
     },
     {
       "name": "Angular (__BROWSER__)",
       "type": "__BROWSER__",
       "request": "launch",
-      "preLaunchTask": "ng-serve",
+      "preLaunchTask": "ng-serve-after-api",
       "url": "http://localhost:__CLIENT_PORT__",
       "webRoot": "${workspaceFolder}/__APP__.Client"
     }
@@ -487,9 +511,11 @@ grep -q "$API_PORT" "$CLIENT_DIR/proxy.conf.json"  || { echo "❌ proxy target p
 grep -q "$API_PORT" "$SERVER_DIR/Properties/launchSettings.json" || { echo "❌ launchSettings port mismatch"; exit 1; }
 [ -f "$ROOT_DIR/.vscode/launch.json" ] || { echo "❌ launch.json missing"; exit 1; }
 ! grep -q "__[A-Z_]*__" "$ROOT_DIR/.vscode/launch.json" "$ROOT_DIR/.vscode/tasks.json" || { echo "❌ unreplaced placeholder in .vscode"; exit 1; }
+grep -q MapScalarApiReference "$SERVER_DIR/Program.cs" || { echo "❌ Scalar not wired in Program.cs"; exit 1; }
 dotnet build "$SERVER_DIR" -nologo -v q
 
 echo "✨ $APP_NAME generated."
 echo "   Run:    cd $APP_NAME && ./run.sh"
 echo "   Verify: cd $APP_NAME && ./verify.sh"
 echo "   Debug:  cd $APP_NAME && code .   then press F5 (Full Stack)"
+echo "   API docs: http://localhost:$API_PORT  (redirects to /scalar)"
