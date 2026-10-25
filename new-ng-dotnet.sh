@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # new-ng-dotnet.sh - Angular (20+) + .NET Web API blueprint for WSL
-# Usage: ./new-ng-dotnet.sh <AppName> [--force] [--api-port 5100] [--client-port 4200] [--browser msedge|chrome]
+# Usage: ./new-ng-dotnet.sh <AppName> [--force] [--api-port 5100] [--client-port 4200] [--browser msedge|chrome] [--https|--no-https]
+# Default: Angular is served over https (dev cert in ~/.aspnet/https); the API stays on plain http.
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 <AppName> [--force] [--api-port 5100] [--client-port 4200] [--browser msedge|chrome]"
+  echo "Usage: $0 <AppName> [--force] [--api-port 5100] [--client-port 4200] [--browser msedge|chrome] [--https|--no-https]"
   exit 1
 }
 
 # ---------------------------------------------------------------- config
-APP_NAME=""; FORCE=0; API_PORT=5100; CLIENT_PORT=4200; DOTNET_TFM="net10.0"; BROWSER="chrome"
+APP_NAME=""; FORCE=0; API_PORT=5100; CLIENT_PORT=4200; DOTNET_TFM="net10.0"; BROWSER="chrome"; HTTPS=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --force)       FORCE=1 ;;
+    --https)       HTTPS=1 ;;
+    --no-https)    HTTPS=0 ;;
     --api-port)    API_PORT="${2:?missing value}"; shift ;;
     --client-port) CLIENT_PORT="${2:?missing value}"; shift ;;
     --browser)     BROWSER="${2:?missing value}"; shift ;;
@@ -23,6 +26,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -n "$APP_NAME" ] || usage
+if [ "$HTTPS" = 1 ]; then CLIENT_SCHEME=https; else CLIENT_SCHEME=http; fi
 [[ "$BROWSER" =~ ^(msedge|chrome)$ ]] || { echo "❌ --browser must be msedge or chrome"; exit 1; }
 [[ "$APP_NAME" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] || {
   echo "❌ AppName must start with a letter and contain only letters, digits, underscore."; exit 1; }
@@ -47,7 +51,32 @@ if [ -e "$ROOT_DIR" ]; then
 fi
 mkdir -p "$ROOT_DIR"
 
-echo "🚀 Generating $APP_NAME  (API http://localhost:$API_PORT, client http://localhost:$CLIENT_PORT)"
+# ---------------------------------------------------------------- dev certificate (Angular https)
+# Same file naming as Visual Studio templates: ~/.aspnet/https/<package name>.pem/.key
+APP_LC="$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]')"
+CERT_BASE="$HOME/.aspnet/https/${APP_LC}.client"
+ensure_cert() {
+  mkdir -p "$HOME/.aspnet/https"
+  if [ -f "$CERT_BASE.pem" ] && [ -f "$CERT_BASE.key" ]; then
+    echo "🔐 Reusing existing cert: $CERT_BASE.pem"; return 0
+  fi
+  # Reuse another app's exported pair (it is the same localhost dev cert).
+  local f
+  for f in "$HOME"/.aspnet/https/*.client.pem; do
+    if [ -f "$f" ] && [ -f "${f%.pem}.key" ]; then
+      cp "$f" "$CERT_BASE.pem"; cp "${f%.pem}.key" "$CERT_BASE.key"
+      chmod 600 "$CERT_BASE.pem" "$CERT_BASE.key"
+      echo "🔐 Copied existing dev cert from $(basename "$f")"; return 0
+    fi
+  done
+  echo "🔐 Creating and exporting the dev certificate..."
+  dotnet dev-certs https >/dev/null 2>&1 || true
+  dotnet dev-certs https --export-path "$CERT_BASE.pem" --format Pem --no-password
+  [ -f "$CERT_BASE.pem" ] && [ -f "$CERT_BASE.key" ] || { echo "❌ cert export failed"; exit 1; }
+}
+if [ "$HTTPS" = 1 ]; then ensure_cert; fi
+
+echo "🚀 Generating $APP_NAME  (API http://localhost:$API_PORT, client $CLIENT_SCHEME://localhost:$CLIENT_PORT)"
 
 # ================================================================ 1. BACKEND
 dotnet new webapi -o "$SERVER_DIR" --framework "$DOTNET_TFM" --no-https
@@ -218,6 +247,20 @@ for (const p of Object.values(cfg.projects)) {
 }
 fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + "\n");
 NODE_EOF
+
+# https: make "npm start" serve over ssl with the exported dev cert (same pattern as WebFamily).
+if [ "$HTTPS" = 1 ]; then
+CLIENT_DIR="$CLIENT_DIR" APP_LC="$APP_LC" node - << 'NODE_EOF'
+const fs = require("fs");
+const path = require("path");
+const file = path.join(process.env.CLIENT_DIR, "package.json");
+const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+const base = "$HOME/.aspnet/https/" + process.env.APP_LC + ".client";
+pkg.scripts = pkg.scripts || {};
+pkg.scripts.start = "ng serve --ssl --ssl-cert " + base + ".pem --ssl-key " + base + ".key";
+fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\n");
+NODE_EOF
+fi
 
 echo '@use "bootstrap/scss/bootstrap";' > "$CLIENT_DIR/src/styles.scss"
 rm -f "$CLIENT_DIR/src/app/app.spec.ts"
@@ -413,7 +456,7 @@ cat << 'JSON_EOF' > "$ROOT_DIR/.vscode/launch.json"
       "type": "__BROWSER__",
       "request": "launch",
       "preLaunchTask": "ng-serve-after-api",
-      "url": "http://localhost:__CLIENT_PORT__",
+      "url": "__CLIENT_SCHEME__://localhost:__CLIENT_PORT__",
       "webRoot": "${workspaceFolder}/__APP__.Client"
     }
   ],
@@ -454,13 +497,13 @@ cat << 'SH_EOF' > "$ROOT_DIR/verify.sh"
 set -euo pipefail
 cd "$(dirname "$0")"
 API="http://127.0.0.1:__API_PORT__"
-WEB="http://127.0.0.1:__CLIENT_PORT__"
+WEB="__CLIENT_SCHEME__://localhost:__CLIENT_PORT__"
 LOG="$(mktemp -d)"
 trap 'trap - EXIT INT TERM; kill 0' EXIT INT TERM
 
 wait_json() {  # url, seconds
   for _ in $(seq 1 "$2"); do
-    if curl -fsS -o /dev/null -D - "$1" 2>/dev/null | grep -qi '^content-type:.*json'; then return 0; fi
+    if curl -fsSk -o /dev/null -D - "$1" 2>/dev/null | grep -qi '^content-type:.*json'; then return 0; fi
     sleep 1
   done
   return 1
@@ -492,7 +535,7 @@ dist/
 GI_EOF
 
 # Replace placeholders in generated files that use them.
-sed -i "s/__APP__/${APP_NAME}/g; s/__API_PORT__/${API_PORT}/g; s/__CLIENT_PORT__/${CLIENT_PORT}/g; s/__TFM__/${DOTNET_TFM}/g; s/__BROWSER__/${BROWSER}/g" \
+sed -i "s/__APP__/${APP_NAME}/g; s/__API_PORT__/${API_PORT}/g; s/__CLIENT_PORT__/${CLIENT_PORT}/g; s/__TFM__/${DOTNET_TFM}/g; s/__BROWSER__/${BROWSER}/g; s/__CLIENT_SCHEME__/${CLIENT_SCHEME}/g" \
   "$SERVER_DIR/appsettings.Local.json" \
   "$SERVER_DIR/appsettings.Linux.json" \
   "$SERVER_DIR/Properties/launchSettings.json" \
@@ -510,6 +553,10 @@ grep -q '"proxyConfig"' "$CLIENT_DIR/angular.json" || { echo "❌ proxyConfig mi
 grep -q "$API_PORT" "$CLIENT_DIR/proxy.conf.json"  || { echo "❌ proxy target port mismatch"; exit 1; }
 grep -q "$API_PORT" "$SERVER_DIR/Properties/launchSettings.json" || { echo "❌ launchSettings port mismatch"; exit 1; }
 [ -f "$ROOT_DIR/.vscode/launch.json" ] || { echo "❌ launch.json missing"; exit 1; }
+if [ "$HTTPS" = 1 ]; then
+  grep -q -- "--ssl-cert" "$CLIENT_DIR/package.json" || { echo "❌ https start script missing in package.json"; exit 1; }
+  [ -f "$CERT_BASE.pem" ] && [ -f "$CERT_BASE.key" ] || { echo "❌ dev cert files missing"; exit 1; }
+fi
 ! grep -q "__[A-Z_]*__" "$ROOT_DIR/.vscode/launch.json" "$ROOT_DIR/.vscode/tasks.json" || { echo "❌ unreplaced placeholder in .vscode"; exit 1; }
 grep -q MapScalarApiReference "$SERVER_DIR/Program.cs" || { echo "❌ Scalar not wired in Program.cs"; exit 1; }
 dotnet build "$SERVER_DIR" -nologo -v q
@@ -518,4 +565,5 @@ echo "✨ $APP_NAME generated."
 echo "   Run:    cd $APP_NAME && ./run.sh"
 echo "   Verify: cd $APP_NAME && ./verify.sh"
 echo "   Debug:  cd $APP_NAME && code .   then press F5 (Full Stack)"
+echo "   App:    $CLIENT_SCHEME://localhost:$CLIENT_PORT"
 echo "   API docs: http://localhost:$API_PORT  (redirects to /scalar)"
