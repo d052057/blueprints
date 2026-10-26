@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 # new-ng-dotnet.sh - Angular (20+) + .NET Web API blueprint for WSL
-# Usage: ./new-ng-dotnet.sh <AppName> [--force] [--api-port 5100] [--client-port 4200] [--browser msedge|chrome] [--https|--no-https]
-# Default: Angular is served over https (dev cert in ~/.aspnet/https); the API stays on plain http.
+# Usage: ./new-ng-dotnet.sh <AppName> [--force] [--api-port 5100] [--client-port 4200] [--browser msedge|chrome] [--https|--no-https] [--api-http]
+# Default: Angular AND the API are served over https with the same PEM cert (~/.aspnet/https/<app>.client.pem/.key).
+#   --api-http  keeps the API on plain http (Angular stays https)
+#   --no-https  everything on plain http
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 <AppName> [--force] [--api-port 5100] [--client-port 4200] [--browser msedge|chrome] [--https|--no-https]"
+  echo "Usage: $0 <AppName> [--force] [--api-port 5100] [--client-port 4200] [--browser msedge|chrome] [--https|--no-https] [--api-http]"
   exit 1
 }
 
 # ---------------------------------------------------------------- config
-APP_NAME=""; FORCE=0; API_PORT=5100; CLIENT_PORT=4200; DOTNET_TFM="net10.0"; BROWSER="chrome"; HTTPS=1
+APP_NAME=""; FORCE=0; API_PORT=5100; CLIENT_PORT=4200; DOTNET_TFM="net10.0"; BROWSER="chrome"; HTTPS=1; API_HTTP=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --force)       FORCE=1 ;;
     --https)       HTTPS=1 ;;
     --no-https)    HTTPS=0 ;;
+    --api-http)    API_HTTP=1 ;;
     --api-port)    API_PORT="${2:?missing value}"; shift ;;
     --client-port) CLIENT_PORT="${2:?missing value}"; shift ;;
     --browser)     BROWSER="${2:?missing value}"; shift ;;
@@ -27,6 +30,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$APP_NAME" ] || usage
 if [ "$HTTPS" = 1 ]; then CLIENT_SCHEME=https; else CLIENT_SCHEME=http; fi
+if [ "$HTTPS" = 1 ] && [ "$API_HTTP" = 0 ]; then API_SCHEME=https; else API_SCHEME=http; fi
 [[ "$BROWSER" =~ ^(msedge|chrome)$ ]] || { echo "❌ --browser must be msedge or chrome"; exit 1; }
 [[ "$APP_NAME" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] || {
   echo "❌ AppName must start with a letter and contain only letters, digits, underscore."; exit 1; }
@@ -55,6 +59,13 @@ mkdir -p "$ROOT_DIR"
 # Same file naming as Visual Studio templates: ~/.aspnet/https/<package name>.pem/.key
 APP_LC="$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]')"
 CERT_BASE="$HOME/.aspnet/https/${APP_LC}.client"
+# Kestrel must serve the SAME pem as Angular (the store cert differs and Windows may not trust it).
+# One-line JSON fragments, empty when the API is plain http.
+CERT_ENV_LS=""; CERT_ENV_VS=""
+if [ "$API_SCHEME" = https ]; then
+  CERT_ENV_LS=', "ASPNETCORE_Kestrel__Certificates__Default__Path": "'"$CERT_BASE"'.pem", "ASPNETCORE_Kestrel__Certificates__Default__KeyPath": "'"$CERT_BASE"'.key"'
+  CERT_ENV_VS=', "ASPNETCORE_Kestrel__Certificates__Default__Path": "${env:HOME}/.aspnet/https/'"$APP_LC"'.client.pem", "ASPNETCORE_Kestrel__Certificates__Default__KeyPath": "${env:HOME}/.aspnet/https/'"$APP_LC"'.client.key"'
+fi
 ensure_cert() {
   mkdir -p "$HOME/.aspnet/https"
   if [ -f "$CERT_BASE.pem" ] && [ -f "$CERT_BASE.key" ]; then
@@ -76,7 +87,7 @@ ensure_cert() {
 }
 if [ "$HTTPS" = 1 ]; then ensure_cert; fi
 
-echo "🚀 Generating $APP_NAME  (API http://localhost:$API_PORT, client $CLIENT_SCHEME://localhost:$CLIENT_PORT)"
+echo "🚀 Generating $APP_NAME  (API $API_SCHEME://localhost:$API_PORT, client $CLIENT_SCHEME://localhost:$CLIENT_PORT)"
 
 # ================================================================ 1. BACKEND
 dotnet new webapi -o "$SERVER_DIR" --framework "$DOTNET_TFM" --no-https
@@ -115,8 +126,8 @@ cat << 'JSON_EOF' > "$SERVER_DIR/Properties/launchSettings.json"
       "commandName": "Project",
       "dotnetRunMessages": true,
       "launchBrowser": false,
-      "applicationUrl": "http://localhost:__API_PORT__",
-      "environmentVariables": { "ASPNETCORE_ENVIRONMENT": "Development" }
+      "applicationUrl": "__API_SCHEME__://localhost:__API_PORT__",
+      "environmentVariables": { "ASPNETCORE_ENVIRONMENT": "Development"__CERT_ENV_LS__ }
     }
   }
 }
@@ -217,7 +228,7 @@ CS_EOF
 cat << PROXY_EOF > "$CLIENT_DIR/proxy.conf.json"
 {
   "/api": {
-    "target": "http://127.0.0.1:${API_PORT}",
+    "target": "${API_SCHEME}://127.0.0.1:${API_PORT}",
     "secure": false,
     "changeOrigin": true,
     "logLevel": "info"
@@ -399,7 +410,7 @@ cat << 'JSON_EOF' > "$ROOT_DIR/.vscode/tasks.json"
     {
       "label": "wait-for-api",
       "type": "shell",
-      "command": "for i in $(seq 1 120); do curl -fs -m 2 http://127.0.0.1:__API_PORT__/health >/dev/null && exit 0; sleep 1; done; echo 'API did not start in time'; exit 1",
+      "command": "for i in $(seq 1 120); do curl -fsk -m 2 __API_SCHEME__://127.0.0.1:__API_PORT__/health >/dev/null && exit 0; sleep 1; done; echo 'API did not start in time'; exit 1",
       "problemMatcher": []
     },
     {
@@ -442,7 +453,7 @@ cat << 'JSON_EOF' > "$ROOT_DIR/.vscode/launch.json"
       "cwd": "${workspaceFolder}/__APP__.Server",
       "env": {
         "ASPNETCORE_ENVIRONMENT": "Development",
-        "ASPNETCORE_URLS": "http://localhost:__API_PORT__"
+        "ASPNETCORE_URLS": "__API_SCHEME__://localhost:__API_PORT__"__CERT_ENV_VS__
       },
       "serverReadyAction": {
         "action": "openExternally",
@@ -496,7 +507,7 @@ cat << 'SH_EOF' > "$ROOT_DIR/verify.sh"
 # Starts both apps and checks: API direct, then API through the Angular proxy.
 set -euo pipefail
 cd "$(dirname "$0")"
-API="http://127.0.0.1:__API_PORT__"
+API="__API_SCHEME__://127.0.0.1:__API_PORT__"
 WEB="__CLIENT_SCHEME__://localhost:__CLIENT_PORT__"
 LOG="$(mktemp -d)"
 trap 'trap - EXIT INT TERM; kill 0' EXIT INT TERM
@@ -535,7 +546,7 @@ dist/
 GI_EOF
 
 # Replace placeholders in generated files that use them.
-sed -i "s/__APP__/${APP_NAME}/g; s/__API_PORT__/${API_PORT}/g; s/__CLIENT_PORT__/${CLIENT_PORT}/g; s/__TFM__/${DOTNET_TFM}/g; s/__BROWSER__/${BROWSER}/g; s/__CLIENT_SCHEME__/${CLIENT_SCHEME}/g" \
+sed -i "s/__APP__/${APP_NAME}/g; s/__API_PORT__/${API_PORT}/g; s/__CLIENT_PORT__/${CLIENT_PORT}/g; s/__TFM__/${DOTNET_TFM}/g; s/__BROWSER__/${BROWSER}/g; s/__CLIENT_SCHEME__/${CLIENT_SCHEME}/g; s/__API_SCHEME__/${API_SCHEME}/g" \
   "$SERVER_DIR/appsettings.Local.json" \
   "$SERVER_DIR/appsettings.Linux.json" \
   "$SERVER_DIR/Properties/launchSettings.json" \
@@ -544,6 +555,9 @@ sed -i "s/__APP__/${APP_NAME}/g; s/__API_PORT__/${API_PORT}/g; s/__CLIENT_PORT__
   "$ROOT_DIR/.vscode/launch.json" \
   "$ROOT_DIR/run.sh" \
   "$ROOT_DIR/verify.sh"
+# Cert env fragments contain / and quotes, so they get their own sed with a different delimiter.
+sed -i "s|__CERT_ENV_LS__|${CERT_ENV_LS}|g" "$SERVER_DIR/Properties/launchSettings.json"
+sed -i "s|__CERT_ENV_VS__|${CERT_ENV_VS}|g" "$ROOT_DIR/.vscode/launch.json"
 chmod +x "$ROOT_DIR/run.sh" "$ROOT_DIR/verify.sh"
 
 # ================================================================ 4. SELF-CHECKS
@@ -553,6 +567,11 @@ grep -q '"proxyConfig"' "$CLIENT_DIR/angular.json" || { echo "❌ proxyConfig mi
 grep -q "$API_PORT" "$CLIENT_DIR/proxy.conf.json"  || { echo "❌ proxy target port mismatch"; exit 1; }
 grep -q "$API_PORT" "$SERVER_DIR/Properties/launchSettings.json" || { echo "❌ launchSettings port mismatch"; exit 1; }
 [ -f "$ROOT_DIR/.vscode/launch.json" ] || { echo "❌ launch.json missing"; exit 1; }
+if [ "$API_SCHEME" = https ]; then
+  grep -q "https://127.0.0.1:$API_PORT" "$CLIENT_DIR/proxy.conf.json" || { echo "❌ proxy target is not https"; exit 1; }
+  grep -q "Kestrel__Certificates__Default__Path" "$ROOT_DIR/.vscode/launch.json" || { echo "❌ Kestrel cert missing in launch.json"; exit 1; }
+  grep -q "Kestrel__Certificates__Default__Path" "$SERVER_DIR/Properties/launchSettings.json" || { echo "❌ Kestrel cert missing in launchSettings.json"; exit 1; }
+fi
 if [ "$HTTPS" = 1 ]; then
   grep -q -- "--ssl-cert" "$CLIENT_DIR/package.json" || { echo "❌ https start script missing in package.json"; exit 1; }
   [ -f "$CERT_BASE.pem" ] && [ -f "$CERT_BASE.key" ] || { echo "❌ dev cert files missing"; exit 1; }
@@ -566,4 +585,4 @@ echo "   Run:    cd $APP_NAME && ./run.sh"
 echo "   Verify: cd $APP_NAME && ./verify.sh"
 echo "   Debug:  cd $APP_NAME && code .   then press F5 (Full Stack)"
 echo "   App:    $CLIENT_SCHEME://localhost:$CLIENT_PORT"
-echo "   API docs: http://localhost:$API_PORT  (redirects to /scalar)"
+echo "   API docs: $API_SCHEME://localhost:$API_PORT  (redirects to /scalar)"
