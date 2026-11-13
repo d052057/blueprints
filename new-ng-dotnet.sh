@@ -243,6 +243,7 @@ const path = require("path");
 const file = path.join(process.env.CLIENT_DIR, "angular.json");
 const cfg = JSON.parse(fs.readFileSync(file, "utf8"));
 const icons = "node_modules/bootstrap-icons/font/bootstrap-icons.css";
+const bsJs = "node_modules/bootstrap/dist/js/bootstrap.bundle.min.js";
 for (const p of Object.values(cfg.projects)) {
   const a = p.architect || {};
   if (a.serve) {
@@ -254,6 +255,8 @@ for (const p of Object.values(cfg.projects)) {
     a.build.options = a.build.options || {};
     const styles = (a.build.options.styles = a.build.options.styles || []);
     if (!styles.includes(icons)) styles.push(icons);
+    const scripts = (a.build.options.scripts = a.build.options.scripts || []);
+    if (!scripts.includes(bsJs)) scripts.push(bsJs);
   }
 }
 fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + "\n");
